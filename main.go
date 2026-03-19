@@ -15,6 +15,7 @@ import (
 	"math/rand"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -125,6 +126,78 @@ func applyFastOverlay(base runtimeTuning) runtimeTuning {
 	return base
 }
 
+// sensitivePathPrefixes is the list of root-owned system directory prefixes
+// that must never be used as custom audio sources when running as root.
+var sensitivePathPrefixes = []string{
+	"/etc",
+	"/var",
+	"/private",
+	"/sys",
+	"/proc",
+	"/dev",
+	"/run",
+	"/boot",
+	"/root",
+	"/usr",
+	"/lib",
+	"/lib64",
+	"/bin",
+	"/sbin",
+	"/System",
+	"/Library/Keychains",
+	"/Library/Security",
+}
+
+// validateCustomPath resolves and sanitizes a user-supplied custom path.
+// It returns the cleaned absolute path, or an error when the path is unsafe.
+// Symlinks are resolved so that their final target is also checked against
+// the sensitive prefix list.
+func validateCustomPath(p string) (string, error) {
+	abs, err := filepath.Abs(filepath.Clean(p))
+	if err != nil {
+		return "", fmt.Errorf("resolving custom path: %w", err)
+	}
+	// Resolve symlinks so we validate the real destination.
+	resolved, err := filepath.EvalSymlinks(abs)
+	if err != nil {
+		return "", fmt.Errorf("evaluating symlinks in custom path: %w", err)
+	}
+	for _, prefix := range sensitivePathPrefixes {
+		if resolved == prefix || strings.HasPrefix(resolved, prefix+string(filepath.Separator)) {
+			return "", fmt.Errorf("custom path %q resolves to a protected system directory", p)
+		}
+	}
+	return resolved, nil
+}
+
+// validateCustomFile resolves and sanitizes a single user-supplied file path.
+// It must be an existing regular file (not a symlink or device).
+func validateCustomFile(f string) (string, error) {
+	abs, err := filepath.Abs(filepath.Clean(f))
+	if err != nil {
+		return "", fmt.Errorf("resolving custom file path: %w", err)
+	}
+	// Lstat so we can detect symlinks before following them.
+	info, err := os.Lstat(abs)
+	if err != nil {
+		return "", fmt.Errorf("custom file not found: %s", f)
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return "", fmt.Errorf("custom file must not be a symlink: %s", f)
+	}
+	if !info.Mode().IsRegular() {
+		return "", fmt.Errorf("custom file must be a regular file: %s", f)
+	}
+	// Check the containing directory against sensitive prefixes.
+	dir := filepath.Dir(abs)
+	for _, prefix := range sensitivePathPrefixes {
+		if dir == prefix || strings.HasPrefix(dir, prefix+string(filepath.Separator)) {
+			return "", fmt.Errorf("custom file %q is inside a protected system directory", f)
+		}
+	}
+	return abs, nil
+}
+
 type soundPack struct {
 	name   string
 	fs     embed.FS
@@ -142,9 +215,20 @@ func (sp *soundPack) loadFiles() error {
 		}
 		sp.files = make([]string, 0, len(entries))
 		for _, entry := range entries {
-			if !entry.IsDir() {
-				sp.files = append(sp.files, sp.dir+"/"+entry.Name())
+			// Use Lstat to detect and skip symlinks; only allow regular files.
+			entryPath := filepath.Join(sp.dir, entry.Name())
+			info, err := os.Lstat(entryPath)
+			if err != nil {
+				continue
 			}
+			if info.Mode()&os.ModeSymlink != 0 {
+				fmt.Fprintf(os.Stderr, "spank: skipping symlink %s\n", entryPath)
+				continue
+			}
+			if !info.Mode().IsRegular() {
+				continue
+			}
+			sp.files = append(sp.files, entryPath)
 		}
 	} else {
 		entries, err := sp.fs.ReadDir(sp.dir)
@@ -154,7 +238,7 @@ func (sp *soundPack) loadFiles() error {
 		sp.files = make([]string, 0, len(entries))
 		for _, entry := range entries {
 			if !entry.IsDir() {
-				sp.files = append(sp.files, sp.dir+"/"+entry.Name())
+				sp.files = append(sp.files, filepath.Join(sp.dir, entry.Name()))
 			}
 		}
 	}
@@ -293,18 +377,25 @@ func run(ctx context.Context, tuning runtimeTuning) error {
 	var pack *soundPack
 	switch {
 	case len(customFiles) > 0:
-		// Validate all files exist and are MP3s
+		// Validate all files: must be MP3s, regular files, not symlinks, not in sensitive directories.
+		sanitized := make([]string, 0, len(customFiles))
 		for _, f := range customFiles {
 			if !strings.HasSuffix(strings.ToLower(f), ".mp3") {
 				return fmt.Errorf("custom file must be MP3: %s", f)
 			}
-			if _, err := os.Stat(f); err != nil {
-				return fmt.Errorf("custom file not found: %s", f)
+			safe, err := validateCustomFile(f)
+			if err != nil {
+				return err
 			}
+			sanitized = append(sanitized, safe)
 		}
-		pack = &soundPack{name: "custom", mode: modeRandom, custom: true, files: customFiles}
+		pack = &soundPack{name: "custom", mode: modeRandom, custom: true, files: sanitized}
 	case customPath != "":
-		pack = &soundPack{name: "custom", dir: customPath, mode: modeRandom, custom: true}
+		safePath, err := validateCustomPath(customPath)
+		if err != nil {
+			return err
+		}
+		pack = &soundPack{name: "custom", dir: safePath, mode: modeRandom, custom: true}
 	case sexyMode:
 		pack = &soundPack{name: "sexy", fs: sexyAudio, dir: "audio/sexy", mode: modeEscalation}
 	case haloMode:
@@ -579,7 +670,7 @@ func processCommands(r io.Reader, w io.Writer) {
 		var cmd stdinCommand
 		if err := json.Unmarshal([]byte(line), &cmd); err != nil {
 			if stdioMode {
-				fmt.Fprintf(w, `{"error":"invalid command: %s"}%s`, err.Error(), "\n")
+				fmt.Fprintf(w, `{"error":"invalid command format"}%s`, "\n")
 			}
 			continue
 		}
@@ -626,7 +717,7 @@ func processCommands(r io.Reader, w io.Writer) {
 			}
 		default:
 			if stdioMode {
-				fmt.Fprintf(w, `{"error":"unknown command: %s"}%s`, cmd.Cmd, "\n")
+				fmt.Fprintf(w, `{"error":"unknown command"}%s`, "\n")
 			}
 		}
 	}

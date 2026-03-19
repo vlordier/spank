@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"encoding/json"
 	"math"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -450,5 +452,113 @@ func TestNoOutputWhenStdioModeDisabled(t *testing.T) {
 
 	if minAmplitude != 0.5 {
 		t.Errorf("expected minAmplitude 0.5, got %f", minAmplitude)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Security validation tests
+// ---------------------------------------------------------------------------
+
+func TestValidateCustomPathRejectsSensitivePaths(t *testing.T) {
+	sensitive := []string{
+		"/etc",
+		"/etc/passwd",
+		"/var/log",
+		"/proc",
+		"/sys",
+		"/dev",
+		"/bin",
+		"/usr/bin",
+		"/root",
+		"/Library/Keychains",
+	}
+	for _, p := range sensitive {
+		_, err := validateCustomPath(p)
+		if err == nil {
+			t.Errorf("validateCustomPath(%q) expected error for sensitive path, got nil", p)
+		}
+	}
+}
+
+func TestValidateCustomPathAcceptsSafePath(t *testing.T) {
+	// Use a real temp directory so EvalSymlinks succeeds.
+	dir := t.TempDir()
+	got, err := validateCustomPath(dir)
+	if err != nil {
+		t.Fatalf("validateCustomPath(%q) unexpected error: %v", dir, err)
+	}
+	if got == "" {
+		t.Error("validateCustomPath returned empty path for a valid temp dir")
+	}
+}
+
+func TestValidateCustomPathNormalizesTraversal(t *testing.T) {
+	// A path with ../ components that resolves inside a sensitive dir must be rejected.
+	// e.g.  /tmp/../etc  resolves to /etc
+	path := "/tmp/../etc"
+	_, err := validateCustomPath(path)
+	if err == nil {
+		t.Errorf("validateCustomPath(%q) expected error for path that resolves to /etc, got nil", path)
+	}
+}
+
+func TestValidateCustomFileRejectsSymlink(t *testing.T) {
+	dir := t.TempDir()
+
+	// Create a real file target.
+	target := filepath.Join(dir, "real.mp3")
+	if err := os.WriteFile(target, []byte("dummy"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create a symlink to it.
+	link := filepath.Join(dir, "link.mp3")
+	if err := os.Symlink(target, link); err != nil {
+		t.Skip("cannot create symlink:", err)
+	}
+
+	_, err := validateCustomFile(link)
+	if err == nil {
+		t.Errorf("validateCustomFile(%q) expected error for symlink, got nil", link)
+	}
+}
+
+func TestValidateCustomFileRejectsDirectory(t *testing.T) {
+	dir := t.TempDir()
+	// Rename to have .mp3 suffix so the extension check passes.
+	mp3Dir := filepath.Join(dir, "sounds.mp3")
+	if err := os.Mkdir(mp3Dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	_, err := validateCustomFile(mp3Dir)
+	if err == nil {
+		t.Errorf("validateCustomFile(%q) expected error for directory, got nil", mp3Dir)
+	}
+}
+
+func TestValidateCustomFileRejectsSensitivePath(t *testing.T) {
+	// /etc/hosts typically exists; its containing dir is /etc which is sensitive.
+	sensitive := "/etc/hosts"
+	if _, statErr := os.Lstat(sensitive); statErr != nil {
+		t.Skip("/etc/hosts not available:", statErr)
+	}
+	_, err := validateCustomFile(sensitive)
+	if err == nil {
+		t.Errorf("validateCustomFile(%q) expected error for file in sensitive dir, got nil", sensitive)
+	}
+}
+
+func TestValidateCustomFileAcceptsValidFile(t *testing.T) {
+	dir := t.TempDir()
+	f := filepath.Join(dir, "test.mp3")
+	if err := os.WriteFile(f, []byte("dummy"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	got, err := validateCustomFile(f)
+	if err != nil {
+		t.Fatalf("validateCustomFile(%q) unexpected error: %v", f, err)
+	}
+	if got == "" {
+		t.Error("validateCustomFile returned empty path for a valid file")
 	}
 }
